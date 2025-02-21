@@ -8,6 +8,14 @@ pub struct NetworkTuple {
     pub dst: SocketAddr,
     pub tcp: bool,
 }
+
+impl std::fmt::Display for NetworkTuple {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tcp = if self.tcp { "TCP" } else { "UDP" };
+        write!(f, "{} {} -> {}", tcp, self.src, self.dst)
+    }
+}
+
 pub mod tcp_flags {
     pub const CWR: u8 = 0b10000000;
     pub const ECE: u8 = 0b01000000;
@@ -53,32 +61,18 @@ impl NetworkPacket {
         let ip = p.net.ok_or(IpStackError::InvalidPacket)?;
 
         let (ip, ip_payload) = match ip {
-            NetSlice::Ipv4(ip) => (
-                IpHeader::Ipv4(ip.header().to_header()),
-                ip.payload().payload,
-            ),
-            NetSlice::Ipv6(ip) => (
-                IpHeader::Ipv6(ip.header().to_header()),
-                ip.payload().payload,
-            ),
+            NetSlice::Ipv4(ip) => (IpHeader::Ipv4(ip.header().to_header()), ip.payload().payload),
+            NetSlice::Ipv6(ip) => (IpHeader::Ipv6(ip.header().to_header()), ip.payload().payload),
             NetSlice::Arp(_) => return Err(IpStackError::UnsupportedTransportProtocol),
         };
         let (transport, payload) = match p.transport {
-            Some(etherparse::TransportSlice::Tcp(h)) => {
-                (TransportHeader::Tcp(h.to_header()), h.payload())
-            }
-            Some(etherparse::TransportSlice::Udp(u)) => {
-                (TransportHeader::Udp(u.to_header()), u.payload())
-            }
+            Some(etherparse::TransportSlice::Tcp(h)) => (TransportHeader::Tcp(h.to_header()), h.payload()),
+            Some(etherparse::TransportSlice::Udp(u)) => (TransportHeader::Udp(u.to_header()), u.payload()),
             _ => (TransportHeader::Unknown, ip_payload),
         };
         let payload = payload.to_vec();
 
-        Ok(NetworkPacket {
-            ip,
-            transport,
-            payload,
-        })
+        Ok(NetworkPacket { ip, transport, payload })
     }
     pub(crate) fn transport_protocol(&self) -> IpStackPacketProtocol {
         match self.transport {
@@ -146,8 +140,47 @@ impl NetworkPacket {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct TcpHeaderWrapper {
+pub struct TcpHeaderWrapper {
     header: TcpHeader,
+}
+
+impl std::fmt::Display for TcpHeaderWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut flags = String::new();
+        if self.header.cwr {
+            flags.push_str("CWR ");
+        }
+        if self.header.ece {
+            flags.push_str("ECE ");
+        }
+        if self.header.urg {
+            flags.push_str("URG ");
+        }
+        if self.header.ack {
+            flags.push_str("ACK ");
+        }
+        if self.header.psh {
+            flags.push_str("PSH ");
+        }
+        if self.header.rst {
+            flags.push_str("RST ");
+        }
+        if self.header.syn {
+            flags.push_str("SYN ");
+        }
+        if self.header.fin {
+            flags.push_str("FIN ");
+        }
+        write!(
+            f,
+            "TcpHeader {{ src_port: {}, dst_port: {}, seq: {}, ack: {}, flags: {} }}",
+            self.header.source_port,
+            self.header.destination_port,
+            self.header.sequence_number,
+            self.header.acknowledgment_number,
+            flags.trim()
+        )
+    }
 }
 
 impl TcpHeaderWrapper {
@@ -188,9 +221,7 @@ impl TcpHeaderWrapper {
 
 impl From<&TcpHeader> for TcpHeaderWrapper {
     fn from(header: &TcpHeader) -> Self {
-        TcpHeaderWrapper {
-            header: header.clone(),
-        }
+        TcpHeaderWrapper { header: header.clone() }
     }
 }
 

@@ -27,7 +27,8 @@ mod packet;
 pub mod stream;
 
 pub use self::error::{IpStackError, Result};
-pub use etherparse::IpNumber;
+pub use self::packet::TcpHeaderWrapper;
+pub use ::etherparse::IpNumber;
 
 const DROP_TTL: u8 = 0;
 
@@ -93,35 +94,27 @@ pub struct IpStack {
 }
 
 impl IpStack {
-    pub fn new<D>(config: IpStackConfig, device: D) -> IpStack
+    pub fn new<Device>(config: IpStackConfig, device: Device) -> IpStack
     where
-        D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        Device: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (accept_sender, accept_receiver) = mpsc::unbounded_channel::<IpStackStream>();
-        let handle = run(config, device, accept_sender);
-
         IpStack {
             accept_receiver,
-            handle,
+            handle: run(config, device, accept_sender),
         }
     }
 
     pub async fn accept(&mut self) -> Result<IpStackStream, IpStackError> {
-        self.accept_receiver
-            .recv()
-            .await
-            .ok_or(IpStackError::AcceptError)
+        self.accept_receiver.recv().await.ok_or(IpStackError::AcceptError)
     }
 }
 
-fn run<D>(
+fn run<Device: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     config: IpStackConfig,
-    mut device: D,
+    mut device: Device,
     accept_sender: UnboundedSender<IpStackStream>,
-) -> JoinHandle<Result<()>>
-where
-    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) -> JoinHandle<Result<()>> {
     let mut sessions: SessionCollection = AHashMap::new();
     let pi = config.packet_information;
     let offset = if pi && cfg!(unix) { 4 } else { 0 };
@@ -167,56 +160,43 @@ fn process_device_read(
     };
 
     if let IpStackPacketProtocol::Unknown = packet.transport_protocol() {
-        return Some(IpStackStream::UnknownTransport(
-            IpStackUnknownTransport::new(
-                packet.src_addr().ip(),
-                packet.dst_addr().ip(),
-                packet.payload,
-                &packet.ip,
-                config.mtu,
-                pkt_sender,
-            ),
-        ));
+        return Some(IpStackStream::UnknownTransport(IpStackUnknownTransport::new(
+            packet.src_addr().ip(),
+            packet.dst_addr().ip(),
+            packet.payload,
+            &packet.ip,
+            config.mtu,
+            pkt_sender,
+        )));
     }
 
     match sessions.entry(packet.network_tuple()) {
         Occupied(mut entry) => {
             if let Err(e) = entry.get().send(packet) {
-                trace!("New stream because: {}", e);
-                create_stream(e.0, config, pkt_sender).map(|s| {
-                    entry.insert(s.0);
-                    s.1
+                log::debug!("New stream \"{}\" because: \"{}\"", e.0.network_tuple(), e);
+                create_stream(e.0, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
+                    entry.insert(packet_sender);
+                    ip_stack_stream
                 })
             } else {
                 None
             }
         }
-        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|s| {
-            entry.insert(s.0);
-            s.1
+        Vacant(entry) => create_stream(packet, config, pkt_sender).map(|(packet_sender, ip_stack_stream)| {
+            entry.insert(packet_sender);
+            ip_stack_stream
         }),
     }
 }
 
-fn create_stream(
-    packet: NetworkPacket,
-    config: &IpStackConfig,
-    pkt_sender: PacketSender,
-) -> Option<(PacketSender, IpStackStream)> {
+fn create_stream(packet: NetworkPacket, config: &IpStackConfig, pkt_sender: PacketSender) -> Option<(PacketSender, IpStackStream)> {
     match packet.transport_protocol() {
         IpStackPacketProtocol::Tcp(h) => {
-            match IpStackTcpStream::new(
-                packet.src_addr(),
-                packet.dst_addr(),
-                h,
-                pkt_sender,
-                config.mtu,
-                config.tcp_timeout,
-            ) {
+            match IpStackTcpStream::new(packet.src_addr(), packet.dst_addr(), h, pkt_sender, config.mtu, config.tcp_timeout) {
                 Ok(stream) => Some((stream.stream_sender(), IpStackStream::Tcp(stream))),
                 Err(e) => {
-                    if matches!(e, IpStackError::InvalidTcpPacket) {
-                        trace!("Invalid TCP packet");
+                    if matches!(e, IpStackError::InvalidTcpPacket(_)) {
+                        log::debug!("{e}");
                     } else {
                         error!("IpStackTcpStream::new failed \"{}\"", e);
                     }
@@ -251,7 +231,9 @@ where
     D: AsyncWrite + Unpin + 'static,
 {
     if packet.ttl() == 0 {
-        sessions.remove(&packet.reverse_network_tuple());
+        let network_tuple = packet.reverse_network_tuple();
+        sessions.remove(&network_tuple);
+        log::trace!("session removed: {}", network_tuple);
         return Ok(());
     }
     #[allow(unused_mut)]
